@@ -1,0 +1,56 @@
+# k8s/cronjob.yaml
+#
+# Runs every hour. Adjust the schedule as needed.
+#
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cf-attacks-cron
+  labels:
+    app: cf-attacks
+spec:
+  schedule: "0 * * * *"                # top of every hour
+  concurrencyPolicy: Forbid            # skip if previous run is still going
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app: cf-attacks
+        spec:
+          restartPolicy: OnFailure
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          containers:
+            - name: cf-attacks
+              image: ghcr.io/vpnagraj/flareups:latest  # ← replace
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              env:
+                - name: CF_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: cf-radar-secret
+                      key: CF_API_TOKEN
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: DYNAMODB_TABLE
+                  value: "k3s-dev-attack-timeseries"  # ← ${StackName}-attack-timeseries
+                - name: S3_BUCKET
+                  value: "YOUR-BUCKET-NAME"   # ← replace
+                - name: S3_PREFIX
+                  value: "charts/"
+                - name: DATE_RANGE
+                  value: "1d"
+                - name: AGG_INTERVAL
+                  value: "1h"

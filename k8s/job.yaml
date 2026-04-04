@@ -1,0 +1,60 @@
+# k8s/job.yaml
+#
+# One-shot Job. For recurring runs, see cronjob.yaml.
+#
+# AWS credentials:
+#   • On K3S atop EC2 (like the CloudFormation stack in this project):
+#     the EC2 instance profile provides credentials via IMDS automatically.
+#   • On EKS: use IRSA — annotate the ServiceAccount with the IAM role ARN.
+#   • Anywhere else: mount an aws-credentials Secret with AWS_ACCESS_KEY_ID /
+#     AWS_SECRET_ACCESS_KEY the same way we mount the CF token below.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cf-attacks-fetch
+  labels:
+    app: cf-attacks
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600   # auto-cleanup 1h after completion
+  template:
+    metadata:
+      labels:
+        app: cf-attacks
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: cf-attacks
+          image: ghcr.io/YOUR_GITHUB_USERNAME/cf-attacks:latest  # ← replace
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          env:
+            # ── Cloudflare token (from K8s Secret) ──
+            - name: CF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cf-radar-secret
+                  key: CF_API_TOKEN
+
+            # ── AWS / app config ──
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: DYNAMODB_TABLE
+              value: "k3s-dev-attack-timeseries"  # ← ${StackName}-attack-timeseries
+            - name: S3_BUCKET
+              value: "YOUR-BUCKET-NAME"       # ← replace
+            - name: S3_PREFIX
+              value: "charts/"
+            - name: DATE_RANGE
+              value: "1d"
+            - name: AGG_INTERVAL
+              value: "1h"

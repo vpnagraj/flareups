@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  K3S on EC2 with Elastic IP, S3 static website hosting, DynamoDB table,
+  and IAM policies for S3 + DynamoDB access.
+  Uses t3a.small for cost-effective K3S with room for a few pods.
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for SSH access
+
+  AllowedSSHCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: CIDR block allowed to SSH into the instance (restrict to your IP for security)
+
+  BucketNameSuffix:
+    Type: String
+    Default: "k3s-static-site"
+    Description: >
+      Suffix for the S3 bucket name. The full name will be
+      ${AWS::StackName}-${BucketNameSuffix}-${AWS::AccountId}
+
+# ─────────────────────────────────────────────
+# Mappings – Ubuntu 24.04 LTS arm64 AMIs (HVM EBS)
+# Using arm64 for Graviton (t4g) cost savings
+# These are Canonical-published ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server AMIs.
+# Update IDs as newer builds are published.
+# ─────────────────────────────────────────────
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0f9de6e2d2f067fca   # Ubuntu 24.04 LTS amd64 us-east-1
+    us-east-2:
+      AMI: ami-0cb91c7de36eed4cb   # Ubuntu 24.04 LTS amd64 us-east-2
+    us-west-1:
+      AMI: ami-0da424eb883458071   # Ubuntu 24.04 LTS amd64 us-west-1
+    us-west-2:
+      AMI: ami-05d38da78ce859165   # Ubuntu 24.04 LTS amd64 us-west-2
+    eu-west-1:
+      AMI: ami-0e9085e60087ce171   # Ubuntu 24.04 LTS amd64 eu-west-1
+    eu-central-1:
+      AMI: ami-0084a47cc718c111a   # Ubuntu 24.04 LTS amd64 eu-central-1
+    ap-southeast-1:
+      AMI: ami-01811d4912b4ccb26   # Ubuntu 24.04 LTS amd64 ap-southeast-1
+    ap-northeast-1:
+      AMI: ami-0a0b7b240264a48d7   # Ubuntu 24.04 LTS amd64 ap-northeast-1
+
+Resources:
+
+  # ───────────────────────────────────────────
+  # VPC / Networking (simple single-AZ setup)
+  # ───────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-subnet"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ───────────────────────────────────────────
+  # Security Group
+  # ───────────────────────────────────────────
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and K3S API access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 6443
+          ToPort: 6443
+          CidrIp: !Ref AllowedSSHCidr
+          Description: K3S API server
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (Traefik ingress)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS (Traefik ingress)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # ───────────────────────────────────────────
+  # IAM Role / Instance Profile
+  # ───────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3StaticSiteWriteAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowS3BucketWrite
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt StaticSiteBucket.Arn
+                  - !Sub "${StaticSiteBucket.Arn}/*"
+        - PolicyName: S3FlareupsBucketAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowFlareupsBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::ds5220-flareups
+                  - arn:aws:s3:::ds5220-flareups/*
+        - PolicyName: DynamoDBAttackTimeseries
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDynamoDBReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt AttackTimeseriesTable.Arn
+      # SSM access so you can use Session Manager as a free alternative to SSH
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # ───────────────────────────────────────────
+  # S3 Bucket – static website hosting
+  # ───────────────────────────────────────────
+  StaticSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${BucketNameSuffix}-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-static-site"
+
+  StaticSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${StaticSiteBucket.Arn}/*"
+
+  # ───────────────────────────────────────────
+  # DynamoDB Table — attack timeseries
+  # ───────────────────────────────────────────
+  AttackTimeseriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-attack-timeseries"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metric
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metric
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-attack-timeseries"
+
+  # ───────────────────────────────────────────
+  # EC2 Instance with cloud-init
+  # ───────────────────────────────────────────
+  K3SInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: AttachGateway
+    Properties:
+      # t3a.small: 2 vCPU, 2 GB RAM, ~$0.019/hr (~$14/mo)
+      # Enough for K3S control plane + 2-3 lightweight pods
+      InstanceType: t3a.small
+      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 25        # 25 GB gp3 — room for images
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-k3s-node"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/cloud-init-k3s.log) 2>&1
+
+          echo "=== [1/6] System update ==="
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get upgrade -y
+
+          echo "=== [2/6] Install dependencies ==="
+          apt-get install -y \
+            curl \
+            ca-certificates \
+            gnupg \
+            jq \
+            unzip \
+            apt-transport-https \
+            open-iscsi \
+            nfs-common
+
+          echo "=== [3/6] Install AWS CLI v2 ==="
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+
+          echo "=== [4/6] Install K3S ==="
+          # Install K3S as a single-node cluster (server mode)
+          # --write-kubeconfig-mode 644 lets non-root users read the kubeconfig
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+            --write-kubeconfig-mode 644 \
+            --disable traefik \
+            --kubelet-arg=eviction-hard=memory.available<100Mi \
+            --kubelet-arg=eviction-soft=memory.available<200Mi \
+            --kubelet-arg=eviction-soft-grace-period=memory.available=30s \
+            --kubelet-arg=system-reserved=memory=256Mi" sh -
+
+          echo "=== [5/6] Configure kubectl for ubuntu user ==="
+          # K3S ships kubectl as a built-in; create a symlink if not present
+          if ! command -v kubectl &>/dev/null; then
+            ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+          fi
+
+          # Set up kubeconfig for the default 'ubuntu' user
+          mkdir -p /home/ubuntu/.kube
+          cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+          chown -R ubuntu:ubuntu /home/ubuntu/.kube
+          chmod 600 /home/ubuntu/.kube/config
+
+          # Add KUBECONFIG to ubuntu's profile
+          echo 'export KUBECONFIG=/home/ubuntu/.kube/config' >> /home/ubuntu/.bashrc
+
+          # Also make kubectl available with bash completion
+          kubectl completion bash > /etc/bash_completion.d/kubectl
+          echo 'alias k=kubectl' >> /home/ubuntu/.bashrc
+          echo 'complete -o default -F __start_kubectl k' >> /home/ubuntu/.bashrc
+
+          echo "=== [6/6] Wait for K3S to be ready ==="
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          for i in $(seq 1 60); do
+            if kubectl get nodes | grep -q ' Ready'; then
+              echo "K3S node is Ready!"
+              break
+            fi
+            echo "Waiting for K3S to be ready... ($i/60)"
+            sleep 5
+          done
+
+          # Print cluster info
+          kubectl get nodes -o wide
+          kubectl get pods -A
+
+          # Seed the S3 bucket with a placeholder index.html
+          BUCKET_NAME="${StaticSiteBucket}"
+          cat > /tmp/index.html <<'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>K3S Static Site</title></head>
+          <body>
+            <h1>Hello from the K3S stack!</h1>
+            <p>This page is served from S3 static website hosting.</p>
+          </body>
+          </html>
+          HTMLEOF
+          aws s3 cp /tmp/index.html "s3://${!BUCKET_NAME}/index.html" \
+            --content-type "text/html"
+
+          echo "=== Cloud-init complete ==="
+
+  # ───────────────────────────────────────────
+  # Elastic IP
+  # ───────────────────────────────────────────
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-eip"
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref K3SInstance
+      AllocationId: !GetAtt ElasticIP.AllocationId
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref K3SInstance
+
+  ElasticIPAddress:
+    Description: Elastic IP bound to the K3S instance
+    Value: !Ref ElasticIP
+
+  SSHCommand:
+    Description: SSH into the instance
+    Value: !Sub "ssh -i <your-key>.pem ubuntu@${ElasticIP}"
+
+  KubectlTip:
+    Description: After SSH, verify K3S
+    Value: "kubectl get nodes && kubectl get pods -A"
+
+  S3BucketName:
+    Description: S3 bucket name
+    Value: !Ref StaticSiteBucket
+
+  S3WebsiteURL:
+    Description: S3 static website endpoint
+    Value: !GetAtt StaticSiteBucket.WebsiteURL
+
+  S3UploadExample:
+    Description: Example command to push files from the instance to S3
+    Value: !Sub "aws s3 sync ./build/ s3://${StaticSiteBucket}/ --delete"
+
+  DynamoDBTableName:
+    Description: DynamoDB table for attack timeseries
+    Value: !Ref AttackTimeseriesTable
+
+  DynamoDBTableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt AttackTimeseriesTable.Arn
