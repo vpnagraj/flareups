@@ -3,23 +3,21 @@
 ## Overview
 This repository includes a containerized data pipeline used to ingest, store, and visualize data from the [Cloudflare Radar API](https://developers.cloudflare.com/api/resources/radar/).
 
-**NOTE: The pipeline is deployed in a (currently) private container image on GHCR.**
-
-The image is used in a pod running on K3S in an EC2 instance. The app writes data to other AWS resources (S3 and DynamoDB).
+The pipeline is deployed in a (currently) private container image on GHCR. The image is used in a pod running on K3S in an AWS EC2 instance. The app writes data to other AWS resources (S3 and DynamoDB).
 
 ## Repository structure
 
-- `Dockerfile`: Dockerfile for the flareups image
+- `Dockerfile`: Dockerfile for the flareups imageK3S
 - `cf_attacks.py`: Python app to pull data from the API, aggregate, load/fetch from DynamoDB, create visualization, sync plot to S3
 - `requirements.txt`: Python requirements for the flareups app
 - `aws/`: CloudFormation template for all AWS resources
-- `k8s/`: Spec files for Kubernetes Job (for testing/debugging) and CronJob (for running at scale) resoures; also includes a script to create Secrets.
+- `k8s/`: Spec files for Kubernetes Job (for testing/debugging) and CronJob (for running at scale) resoures; also includes a script to create Secrets
 
 ## Launching the stack
 
 **NOTE: All commands should be run from the repository root.**
 
-First build the image and push to GHCR (assumes logged into GHCR and GitHub PAT has been passed):
+First build the image and push to GHCR (assumes the user is logged into GHCR and GitHub PAT has been passed):
 
 ```bash
 ## build
@@ -53,7 +51,7 @@ aws cloudformation describe-stacks \
 
 One of the outputs should be an `ssh` command to connect to the instance.
 
-Connect to the instance and confirm `K3S` is installed:
+Connect to the instance and confirm K3S was installed successfully in the EC2 cloud init script:
 
 ```bash
 kubectl get pods
