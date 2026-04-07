@@ -5,6 +5,8 @@ This repository includes a containerized data pipeline used to ingest, store, an
 
 The pipeline is deployed in a (currently) private container image on GHCR. The image is used in a pod running on K3S in an AWS EC2 instance. The app writes data to other AWS resources (S3 and DynamoDB).
 
+The output of the pipeline is a CSV file with relative L7 attack traffic data aggregated by hour, as well as a line plot (saved as a PNG file) visualizing these metrics. The output files are updated each time the job runs (i.e., hourly) and are written to S3.
+
 ## Repository structure
 
 - `Dockerfile`: Dockerfile for the flareups imageK3S
