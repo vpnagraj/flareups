@@ -24,7 +24,7 @@ import sys
 import logging
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from io import BytesIO
+from io import BytesIO, StringIO
 
 import boto3
 import pandas as pd
@@ -143,48 +143,56 @@ def save_to_dynamodb(df: pd.DataFrame) -> int:
     return written
 
 
-def load_history_from_dynamodb(hours: int = CHART_HOURS) -> pd.DataFrame:
+def load_history_from_dynamodb(hours: int | None = CHART_HOURS) -> pd.DataFrame:
     """
     Query DynamoDB for the last N hours of data points.
+    Pass hours=None to load the entire history (used for the CSV export).
     Returns a DataFrame sorted by timestamp.
     """
     table = _dynamodb_table()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
-    resp = table.query(
-        KeyConditionExpression="metric = :m AND #ts >= :cutoff",
-        ExpressionAttributeNames={"#ts": "timestamp"},
-        ExpressionAttributeValues={
-            ":m":      "l7_attack_pct",
-            ":cutoff": cutoff,
-        },
-    )
+    if hours is None:
+        # Full history — query all rows for this metric
+        key_expr   = "metric = :m"
+        expr_names = None
+        expr_vals  = {":m": "l7_attack_pct"}
+        log_label  = "full history"
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        key_expr   = "metric = :m AND #ts >= :cutoff"
+        expr_names = {"#ts": "timestamp"}
+        expr_vals  = {":m": "l7_attack_pct", ":cutoff": cutoff}
+        log_label  = f"last {hours} hours"
 
+    query_kwargs = {
+        "KeyConditionExpression":    key_expr,
+        "ExpressionAttributeValues": expr_vals,
+    }
+    if expr_names:
+        query_kwargs["ExpressionAttributeNames"] = expr_names
+
+    resp = table.query(**query_kwargs)
     items = resp.get("Items", [])
     while resp.get("LastEvaluatedKey"):
-        resp = table.query(
-            KeyConditionExpression="metric = :m AND #ts >= :cutoff",
-            ExpressionAttributeNames={"#ts": "timestamp"},
-            ExpressionAttributeValues={
-                ":m":      "l7_attack_pct",
-                ":cutoff": cutoff,
-            },
-            ExclusiveStartKey=resp["LastEvaluatedKey"],
-        )
+        resp = table.query(**query_kwargs,
+                           ExclusiveStartKey=resp["LastEvaluatedKey"])
         items.extend(resp.get("Items", []))
 
     if not items:
-        log.warning("No historical data in DynamoDB for the last %d hours.", hours)
-        return pd.DataFrame(columns=["timestamp", "pct_attacks"])
+        log.warning("No historical data in DynamoDB (%s).", log_label)
+        return pd.DataFrame(columns=["timestamp", "pct_attacks", "fetched_at"])
 
     df = pd.DataFrame(items)
     df["timestamp"]   = pd.to_datetime(df["timestamp"], utc=True)
     df["pct_attacks"] = df["value"].astype(float)
-    df = df[["timestamp", "pct_attacks"]].sort_values("timestamp").reset_index(drop=True)
+    keep_cols = ["timestamp", "pct_attacks"]
+    if "fetched_at" in df.columns:
+        keep_cols.append("fetched_at")
+    df = df[keep_cols].sort_values("timestamp").reset_index(drop=True)
     df = df.drop_duplicates(subset="timestamp", keep="last")
 
-    log.info("Loaded %d historical points from DynamoDB (last %d hours).",
-             len(df), hours)
+    log.info("Loaded %d historical points from DynamoDB (%s).",
+             len(df), log_label)
     return df
 
 
@@ -264,7 +272,7 @@ def generate_chart(df: pd.DataFrame) -> BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# S3 upload
+# S3 uploads
 # ---------------------------------------------------------------------------
 def upload_chart_to_s3(buf: BytesIO) -> str:
     now_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -281,6 +289,37 @@ def upload_chart_to_s3(buf: BytesIO) -> str:
 
     uri = f"s3://{S3_BUCKET}/{key}"
     log.info("Chart uploaded -> %s  (+ latest copy)", uri)
+    return uri
+
+
+def upload_csv_to_s3(df: pd.DataFrame) -> str:
+    """
+    Serialise the full time series to CSV and upload to S3 next to the chart.
+    Writes both a timestamped snapshot and a stable 'latest' key.
+    """
+    if df.empty:
+        log.warning("CSV export skipped — DataFrame is empty.")
+        return ""
+
+    buf = StringIO()
+    df.to_csv(buf, index=False, date_format="%Y-%m-%dT%H:%M:%S%z")
+    body = buf.getvalue().encode("utf-8")
+
+    now_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    key = f"{S3_PREFIX}attacks_{now_tag}.csv"
+
+    _s3_client().put_object(
+        Bucket=S3_BUCKET, Key=key,
+        Body=body, ContentType="text/csv",
+    )
+    _s3_client().put_object(
+        Bucket=S3_BUCKET, Key=f"{S3_PREFIX}attacks_latest.csv",
+        Body=body, ContentType="text/csv",
+    )
+
+    uri = f"s3://{S3_BUCKET}/{key}"
+    log.info("CSV uploaded -> %s  (%d rows, %d KB, + latest copy)",
+             uri, len(df), len(body) // 1024)
     return uri
 
 
@@ -304,21 +343,25 @@ def main() -> None:
     # 2. Persist to DynamoDB
     save_to_dynamodb(fresh_df)
 
-    # 3. Pull full history from DynamoDB for the chart
-    #    This gives us a longer view than a single API call.
-    history_df = load_history_from_dynamodb(hours=CHART_HOURS)
+    # 3. Pull full history from DynamoDB (used for both CSV export and chart)
+    full_history_df = load_history_from_dynamodb(hours=None)
 
-    # Fall back to just the fresh data if DynamoDB is empty (first run)
-    chart_df = history_df if not history_df.empty else fresh_df
+    # 4. Slice the chart window from the full history (avoids a second query)
+    if not full_history_df.empty:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=CHART_HOURS)
+        chart_df = full_history_df[full_history_df["timestamp"] >= cutoff].copy()
+    else:
+        chart_df = fresh_df  # first run fallback
 
     log.info("Charting %d data points spanning %s -> %s",
              len(chart_df),
              chart_df["timestamp"].min().strftime("%Y-%m-%d %H:%M"),
              chart_df["timestamp"].max().strftime("%Y-%m-%d %H:%M"))
 
-    # 4. Render and upload
+    # 5. Render chart and upload both artifacts
     chart_buf = generate_chart(chart_df)
     upload_chart_to_s3(chart_buf)
+    upload_csv_to_s3(full_history_df)
 
     log.info("Done.")
 
