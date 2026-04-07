@@ -219,7 +219,7 @@ def generate_chart(df: pd.DataFrame) -> BytesIO:
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
 
     # Axis labels
-    ax.set_ylabel("Attack traffic %", fontsize=10)
+    ax.set_ylabel("Relative attack traffic", fontsize=10)
     ax.set_xlabel("")
     ax.set_title("Layer 7 Attack Traffic — Hourly", fontsize=11,
                  fontweight="bold", pad=10)
